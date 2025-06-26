@@ -12,10 +12,11 @@ import os
 import logging
 from datetime import datetime
 import smtplib
+import functools
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-# Setup logging to file and console
+# Setup logging
 logging.basicConfig(
     filename='tarjomic_log.txt',
     level=logging.INFO,
@@ -31,18 +32,34 @@ def log_error(msg):
     print(msg)
     logging.error(msg)
 
-# SMS API info (adjust these with your actual API details)
+# Retry decorator
+def retry(max_attempts=3, delay=5):
+    def decorator_retry(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            attempts = 0
+            while attempts < max_attempts:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    attempts += 1
+                    log_error(f"Retry {attempts}/{max_attempts} after error: {e}")
+                    time.sleep(delay)
+            raise Exception(f"{func.__name__} failed after {max_attempts} attempts.")
+        return wrapper
+    return decorator_retry
+
+# SMS API
 SMS_API_URL = 'https://console.melipayamak.com/api/send/simple/31760f37050144939d098478f2127537'
 SMS_FROM = '50002710011550'
-SMS_TO = '09198115505'  # Change to your phone number
+SMS_TO = '09198115505'
 
-# Accounts list
 accounts = [
     {"name": "erfan", "email": "erfan_ahadi2@ymail.com", "password": "123456"},
     {"name": "ashkan", "email": "e.ahadi4444@gmail.com", "password": "erfan4444"}
 ]
 
-# Load existing orders from file or initialize empty dict
+# Load or initialize orders
 if os.path.exists('old_orders.json'):
     with open('old_orders.json', 'r', encoding='utf-8') as f:
         try:
@@ -52,9 +69,9 @@ if os.path.exists('old_orders.json'):
 else:
     old_orders = {}
 
-# Chrome options for headless browsing
+# Chrome options
 chrome_options = Options()
-chrome_options.add_argument("--headless=new")  # new headless mode
+chrome_options.add_argument("--headless=new")
 chrome_options.add_argument("--disable-gpu")
 chrome_options.add_argument("--window-size=1920,1080")
 chrome_options.add_argument("--no-sandbox")
@@ -63,7 +80,7 @@ chrome_options.add_argument("--disable-dev-shm-usage")
 def send_sms(text):
     data = {'from': SMS_FROM, 'to': SMS_TO, 'text': text}
     try:
-        response = requests.post(SMS_API_URL, json=data)
+        response = requests.post(SMS_API_URL, json=data, timeout=10)
         if response.ok:
             log_info(f"SMS sent successfully: {text}")
         else:
@@ -72,9 +89,8 @@ def send_sms(text):
         log_error(f"Exception sending SMS: {e}")
 
 def send_email(receiver, subject, body):
-    sender_email = 'e.ahadi4444@gmail.com' 
-    sender_password = 'bkztjgwxggmgibmc' 
-
+    sender_email = 'e.ahadi4444@gmail.com'
+    sender_password = 'bkztjgwxggmgibmc'
     try:
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
@@ -87,6 +103,28 @@ def send_email(receiver, subject, body):
     finally:
         server.quit()
 
+@retry(max_attempts=3, delay=8)
+def perform_login(driver, email, password):
+    driver.get("https://tarjomic.com/login")
+
+    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.ID, "txtEmailLogin")))
+    driver.find_element(By.ID, "txtEmailLogin").send_keys(email)
+    driver.find_element(By.ID, "txtPasswordLogin").send_keys(password)
+
+    login_button = WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.ID, "btnLogin"))
+    )
+    driver.execute_script("arguments[0].click();", login_button)
+
+    WebDriverWait(driver, 20).until(lambda d: "login" not in d.current_url.lower())
+
+@retry(max_attempts=3, delay=5)
+def get_orders(session, headers):
+    payload = {"type": "WaitingForCurrentTranslator"}
+    response = session.post("https://tarjomic.com/api/getOrders", json=payload, headers=headers, timeout=10)
+    response.raise_for_status()
+    return response.json()
+
 def check_account(account):
     name = account['name']
     email = account['email']
@@ -97,25 +135,10 @@ def check_account(account):
     driver = None
     try:
         driver = webdriver.Chrome(options=chrome_options)
-        driver.get("https://tarjomic.com/login")
-        time.sleep(3)
-
-        driver.find_element(By.ID, "txtEmailLogin").send_keys(email)
-        driver.find_element(By.ID, "txtPasswordLogin").send_keys(password)
-
-        login_button = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.ID, "btnLogin"))
-        )
-        time.sleep(1)
-        driver.execute_script("arguments[0].click();", login_button)
-        time.sleep(5)
-
-        
-        if "login" in driver.current_url.lower():
-            raise Exception("Login failed: Invalid credentials or page did not change.")
+        perform_login(driver, email, password)
 
         driver.get("https://tarjomic.com/translator")
-        time.sleep(3)
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
 
         cookies = {c['name']: c['value'] for c in driver.get_cookies()}
         session = requests.Session()
@@ -127,13 +150,10 @@ def check_account(account):
             "Referer": "https://tarjomic.com/translator",
             "User-Agent": driver.execute_script("return navigator.userAgent")
         }
-        payload = {"type": "WaitingForCurrentTranslator"}
 
-        response = session.post("https://tarjomic.com/api/getOrders", json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-
+        data = get_orders(session, headers)
         orders = data.get("orders", [])
+
         if not orders:
             log_info(f"ℹ️ No orders for [{name}]")
         else:
@@ -151,10 +171,9 @@ def check_account(account):
                 msg = f"New orders for {name}!\nOrder IDs: {', '.join(map(str, new_orders))}"
                 send_sms(msg)
                 send_email('e.ahadi4444@gmail.com', f"New orders for {name}", msg)
-                
+
     except Exception as e:
         log_error(f"❌ [{name}] Error: {e}")
-
     finally:
         if driver:
             driver.quit()
@@ -163,13 +182,10 @@ def main():
     log_info("🔄 Checking accounts...")
     for account in accounts:
         check_account(account)
-    # Save old_orders to file
     with open('old_orders.json', 'w', encoding='utf-8') as f:
         json.dump(old_orders, f, ensure_ascii=False, indent=2)
     log_info("✅ Done\n")
 
 if __name__ == "__main__":
-    import os
-
     if os.environ.get('PYTEST_RUNNING') != 'true':
         main()
